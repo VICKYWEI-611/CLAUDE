@@ -6,10 +6,16 @@ name: Book Friday swim
 on:
   workflow_dispatch: {}      # lets you run it manually from the Actions tab
   schedule:
-    # Example: 12:01 UTC daily. Markham is UTC-4 (EDT) in summer / UTC-5 (EST)
-    # in winter, so 12:01 UTC ≈ 8:01 AM EDT / 7:01 AM EST. Change to match the
-    # exact moment your booking window opens.
-    - cron: "1 12 * * *"
+    # Booking opens Thursday 11:00 AM Markham time (21h before Fri 8:00 AM).
+    # We fire a bit EARLY and let the script wait for the exact open moment
+    # (it holds until openTime, up to MAX_WAIT_MINUTES) — this absorbs the
+    # few-minute delay GitHub often adds to scheduled runs.
+    #
+    # Cron is UTC and does NOT follow DST. 11:00 Markham =
+    #   14:45 UTC  → 10:45 EDT (summer, UTC-4)  ← active line below
+    #   15:45 UTC  → 10:45 EST (winter, UTC-5)  ← switch to this in winter
+    - cron: "45 14 * * 4"    # Thursday, EDT (summer)
+    # - cron: "45 15 * * 4"  # Thursday, EST (winter)
 
 jobs:
   book:
@@ -33,8 +39,9 @@ jobs:
           PM_PASSWORD: ${{ secrets.PM_PASSWORD }}
           # Uncomment / add as repository secrets or vars to override defaults:
           # SESSION_KEYWORDS: ${{ vars.SESSION_KEYWORDS }}
-          # DAYS_AHEAD: ${{ vars.DAYS_AHEAD }}
+          # OPEN_HOURS_BEFORE: ${{ vars.OPEN_HOURS_BEFORE }}
           HEADLESS: "1"
+          MAX_WAIT_MINUTES: "45"   # cover early fire + GitHub's scheduling delay
         run: node book-swim.mjs
 
       - name: Upload screenshots (for debugging)

@@ -57,10 +57,18 @@ const CONFIG = {
     .split(",")
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean),
-  // How many days ahead the booking window opens. The script targets the
-  // furthest-out Friday that is <= today + this many days. City of Markham
-  // drop-ins commonly open a few days ahead; adjust to match reality.
-  daysAhead: Number(process.env.DAYS_AHEAD ?? 7),
+  // Booking opens this many hours before the session start time.
+  // Friday 8:00 AM session => opens Thursday 11:00 AM (8:00 - 21h).
+  openHoursBefore: Number(process.env.OPEN_HOURS_BEFORE ?? 21),
+  // If the booking window hasn't opened yet, wait for it — but only up to this
+  // many minutes. If it's further out than this, the script exits with a note
+  // (so a mis-timed run doesn't hang). Set FORCE=1 to wait regardless.
+  maxWaitMinutes: Number(process.env.MAX_WAIT_MINUTES ?? 30),
+  force: process.env.FORCE === "1",
+  // Right after the window opens, spots can vanish in seconds. Retry the
+  // find+book this many times before giving up.
+  bookRetries: Number(process.env.BOOK_RETRIES ?? 6),
+  bookRetryDelayMs: Number(process.env.BOOK_RETRY_DELAY_MS ?? 2500),
   headless: process.env.HEADLESS !== "0",
   dryRun: process.env.DRY_RUN === "1",
   timeoutMs: Number(process.env.STEP_TIMEOUT_MS ?? 30000),
@@ -83,19 +91,50 @@ function fail(msg) {
   process.exitCode = 1;
 }
 
-/** Date (YYYY-MM-DD) of the target weekday within the booking window. */
-function computeTargetDate() {
+/** Parse a "8:00 AM" style time into 24h {hour, minute}. */
+function parseTime(s) {
+  const m = /(\d{1,2}):(\d{2})\s*(a\.?m\.?|p\.?m\.?)?/i.exec(s || "");
+  if (!m) return { hour: 8, minute: 0 };
+  let hour = Number(m[1]);
+  const minute = Number(m[2]);
+  const ap = (m[3] || "").toLowerCase();
+  if (ap.startsWith("p") && hour < 12) hour += 12;
+  if (ap.startsWith("a") && hour === 12) hour = 0;
+  return { hour, minute };
+}
+
+/**
+ * The next occurrence of the target weekday at the target time that is still
+ * in the future (local time). Returns a Date at the session start moment.
+ */
+function computeTargetSession() {
   const now = new Date();
-  const windowEnd = new Date(now);
-  windowEnd.setDate(now.getDate() + CONFIG.daysAhead);
-  // Walk backwards from the end of the window to find the target weekday.
-  const d = new Date(windowEnd);
-  while (d.getDay() !== CONFIG.targetWeekday) {
-    d.setDate(d.getDate() - 1);
+  const { hour, minute } = parseTime(CONFIG.targetTime);
+  const d = new Date(now);
+  d.setHours(hour, minute, 0, 0);
+  while (d.getDay() !== CONFIG.targetWeekday || d <= now) {
+    d.setDate(d.getDate() + 1);
   }
-  // If that lands before today, jump forward one week (shouldn't normally).
-  if (d < now) d.setDate(d.getDate() + 7);
   return d;
+}
+
+/** The moment the booking window opens for a given session start. */
+function computeOpenTime(sessionStart) {
+  return new Date(sessionStart.getTime() - CONFIG.openHoursBefore * 3600 * 1000);
+}
+
+/** Sleep until `when`, logging a countdown; refreshes are handled by caller. */
+async function waitUntil(when, label) {
+  let remaining = when.getTime() - Date.now();
+  log(`Waiting ~${Math.round(remaining / 1000)}s until ${label}…`);
+  while (Date.now() < when.getTime()) {
+    remaining = when.getTime() - Date.now();
+    const step = Math.min(remaining, 15000);
+    // Chunked sleep so long waits still show progress.
+    await new Promise((r) => setTimeout(r, Math.max(step, 250)));
+    const left = when.getTime() - Date.now();
+    if (left > 0 && left % 60000 < 15000) log(`  …${Math.round(left / 1000)}s to go`);
+  }
 }
 
 function fmtLong(d) {
@@ -313,12 +352,12 @@ async function completeBooking(page) {
       "No explicit confirm button found. The booking may already be complete, " +
         "or the page needs a selector tweak. Check the screenshot."
     );
-    return;
+    return "no-confirm";
   }
 
   if (CONFIG.dryRun) {
     log("🧪 DRY_RUN=1 — stopping before final confirm. Not submitting.");
-    return;
+    return "dry";
   }
 
   log("Submitting final confirmation…");
@@ -327,6 +366,7 @@ async function completeBooking(page) {
     confirmBtn.click(),
   ]);
   await page.waitForTimeout(2500);
+  return "submitted";
 }
 
 async function main() {
@@ -336,10 +376,29 @@ async function main() {
     );
   }
 
-  const targetDate = computeTargetDate();
+  const targetDate = computeTargetSession();
+  const openTime = computeOpenTime(targetDate);
   log("Target session:", fmtLong(targetDate), "@", CONFIG.targetTime);
+  log(
+    `Booking opens ${CONFIG.openHoursBefore}h before →`,
+    openTime.toLocaleString("en-CA")
+  );
   log("Keywords:", CONFIG.titleKeywords.join(" + ") || "(none)");
   log("Mode:", CONFIG.dryRun ? "DRY RUN" : "LIVE", "| headless:", CONFIG.headless);
+
+  // Decide whether to wait for the window, book now, or bail out.
+  const msUntilOpen = openTime.getTime() - Date.now();
+  if (msUntilOpen > 0 && !CONFIG.dryRun) {
+    const maxWaitMs = CONFIG.maxWaitMinutes * 60000;
+    if (msUntilOpen > maxWaitMs && !CONFIG.force) {
+      return fail(
+        `Booking doesn't open until ${openTime.toLocaleString("en-CA")} ` +
+          `(${Math.round(msUntilOpen / 60000)} min from now), which is beyond ` +
+          `MAX_WAIT_MINUTES=${CONFIG.maxWaitMinutes}. Schedule this run closer to ` +
+          `the open time, raise MAX_WAIT_MINUTES, or set FORCE=1 to wait anyway.`
+      );
+    }
+  }
 
   const launchOpts = { headless: CONFIG.headless };
   if (CONFIG.executablePath) launchOpts.executablePath = CONFIG.executablePath;
@@ -363,36 +422,64 @@ async function main() {
     // Persist the session for next time.
     await context.storageState({ path: CONFIG.storageStatePath }).catch(() => {});
 
-    // Re-load the calendar in case login redirected us away.
-    await page.goto(CONFIG.calendarUrl, { waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(2500);
-
-    await navigateToDate(page, targetDate);
-    await shot(page, "calendar");
-
-    const opened = await findAndOpenSession(page, targetDate);
-    if (!opened) {
-      await shot(page, "session-not-found");
-      return fail(
-        `Could not find a "${CONFIG.titleKeywords.join(" ")}" session at ${CONFIG.targetTime} ` +
-          `on ${fmtLong(targetDate)}. It may not be open for booking yet, or the ` +
-          `keywords/time need adjusting. See the screenshot in ${CONFIG.screenshotDir}.`
-      );
+    // We're logged in and ready. Now hold until the booking window opens
+    // (spots for this session go live exactly at `openTime`).
+    if (openTime.getTime() > Date.now() && !CONFIG.dryRun) {
+      await waitUntil(openTime, "booking window opens");
+      log("🟢 Window open — going for it.");
     }
 
-    await completeBooking(page);
-    await shot(page, "result");
+    // Try repeatedly: right at open, the session may take a beat to appear or
+    // may briefly show as full during the rush.
+    let booked = false;
+    for (let attempt = 1; attempt <= CONFIG.bookRetries && !booked; attempt++) {
+      log(`Attempt ${attempt}/${CONFIG.bookRetries}…`);
+      // Fresh load each attempt for up-to-date availability.
+      await page.goto(CONFIG.calendarUrl, { waitUntil: "domcontentloaded" });
+      await page.waitForTimeout(2500);
+      await navigateToDate(page, targetDate);
+      if (attempt === 1) await shot(page, "calendar");
 
-    // Best-effort success detection.
-    const body = (await page.locator("body").innerText().catch(() => "")) || "";
-    if (/confirmed|booked|success|thank you|reservation/i.test(body) && !CONFIG.dryRun) {
-      log("✅ Booking appears confirmed for", fmtLong(targetDate));
-    } else if (CONFIG.dryRun) {
-      log("🧪 Dry run finished. Review screenshots to confirm the flow reached checkout.");
-    } else {
-      log(
-        "⚠️  Could not positively confirm the booking from page text. " +
-          "Check the 'result' screenshot and your account."
+      const opened = await findAndOpenSession(page, targetDate);
+      if (!opened) {
+        log("Session not found/openable on this attempt.");
+        if (attempt < CONFIG.bookRetries) {
+          await page.waitForTimeout(CONFIG.bookRetryDelayMs);
+          continue;
+        }
+        await shot(page, "session-not-found");
+        return fail(
+          `Could not find a "${CONFIG.titleKeywords.join(" ")}" session at ${CONFIG.targetTime} ` +
+            `on ${fmtLong(targetDate)} after ${CONFIG.bookRetries} attempts. It may be full, ` +
+            `not open yet, or the keywords/time need adjusting. See ${CONFIG.screenshotDir}.`
+        );
+      }
+
+      const status = await completeBooking(page);
+      await shot(page, `result-attempt-${attempt}`);
+
+      const body = (await page.locator("body").innerText().catch(() => "")) || "";
+      const looksConfirmed = /confirmed|booked|success|thank you|reservation/i.test(body);
+
+      if (CONFIG.dryRun) {
+        log("🧪 Dry run finished. Review screenshots to confirm the flow reached checkout.");
+        booked = true;
+      } else if (status === "submitted" && looksConfirmed) {
+        log("✅ Booking confirmed for", fmtLong(targetDate));
+        booked = true;
+      } else if (status === "submitted") {
+        log("Submitted, but couldn't positively confirm from page text — check the screenshot.");
+        booked = true;
+      } else {
+        log("Booking didn't complete on this attempt.");
+        if (attempt < CONFIG.bookRetries) await page.waitForTimeout(CONFIG.bookRetryDelayMs);
+      }
+    }
+
+    if (!booked && !CONFIG.dryRun) {
+      return fail(
+        `Exhausted ${CONFIG.bookRetries} attempts without a confirmed booking. ` +
+          `The spot may have filled, or a selector needs adjusting. See ${CONFIG.screenshotDir}.`
       );
     }
   } catch (err) {

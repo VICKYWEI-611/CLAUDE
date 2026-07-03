@@ -58,7 +58,10 @@ node book-swim.mjs
 | `TARGET_WEEKDAY` | `5` | Day to book (0=Sun … 5=Fri … 6=Sat). |
 | `TARGET_TIME` | `8:00 AM` | Session start time, exactly as shown on the page. |
 | `SESSION_KEYWORDS` | `swim` | Comma-separated words that must **all** appear in the title. |
-| `DAYS_AHEAD` | `7` | How many days ahead the booking window opens; the script targets the furthest Friday within it. |
+| `OPEN_HOURS_BEFORE` | `21` | Booking opens this many hours before the session (Fri 8 AM → Thu 11 AM). |
+| `MAX_WAIT_MINUTES` | `30` | If the window isn't open yet, wait up to this long, then give up. |
+| `FORCE` | off | `1` to wait for the window no matter how far off. |
+| `BOOK_RETRIES` | `6` | Attempts to find+book at open time (spots can vanish fast). |
 | `HEADLESS` | `1` | `0` to watch the browser. |
 | `DRY_RUN` | off | `1` to stop before the final confirm. |
 | `PM_CALENDAR_URL` | Aaniin swim calendar | Override to book a different calendar. |
@@ -67,10 +70,15 @@ node book-swim.mjs
 
 ## Scheduling
 
-**Key question: when does Markham open the booking window?** Drop-in bookings
-typically open a fixed number of days in advance, at a specific time. Set
-`DAYS_AHEAD` to that number and schedule the script to run right when the window
-opens, so you're first in line.
+**Booking opens 21 hours before the session start.** For a Friday 8:00 AM swim,
+that's **Thursday 11:00 AM**. The script figures this out automatically: it
+targets the next Friday session, computes the open moment (`OPEN_HOURS_BEFORE`,
+default 21), logs in, and then **waits until 11:00 AM and pounces**, retrying a
+few times in case the spot flickers as it goes live.
+
+So: schedule the script to start a little **before** Thursday 11:00 AM. It will
+log in early and hold at the ready. If you start it too far ahead of the window
+(beyond `MAX_WAIT_MINUTES`), it exits with a note instead of hanging.
 
 ### Option A — GitHub Actions (runs in the cloud, no PC needed)
 
@@ -79,17 +87,26 @@ A workflow is included at `.github/workflows/book-swim.yml`.
 1. Push this repo to GitHub.
 2. In **Settings → Secrets and variables → Actions**, add repository secrets
    `PM_EMAIL` and `PM_PASSWORD`.
-3. Edit the `cron:` line in the workflow to fire when your booking window opens.
-   Cron is in **UTC**; Markham is UTC−4 (EDT, summer) / UTC−5 (EST, winter).
-   Example: `1 12 * * *` ≈ 8:01 AM EDT.
+3. The workflow is preset to fire **Thursday ~10:45 AM Markham time** and wait
+   for the 11:00 open. Cron is **UTC** and ignores DST, so twice a year you
+   swap the active line: `45 14 * * 4` in summer (EDT), `45 15 * * 4` in winter
+   (EST). Both are in the file.
 4. You can also trigger it manually from the **Actions** tab. Screenshots are
    uploaded as an artifact for debugging.
+
+> ⚠️ **GitHub's scheduled runs are often delayed 5–15+ minutes** at busy times.
+> If these spots fill within seconds of opening, GitHub Actions may be too slow
+> to reliably win one — a local cron (Option B) or a small always-on machine
+> with accurate timing is a safer bet. The script's built-in wait helps, but it
+> can only pounce once GitHub actually starts the job.
 
 ### Option B — cron on your own machine / a server
 
 ```cron
-# Every day at 12:01 AM local time (adjust to your booking-window opening).
-1 0 * * *  cd /path/to/CLAUDE && /usr/bin/node book-swim.mjs >> book-swim.log 2>&1
+# Thursday 10:55 AM LOCAL time — starts 5 min early; the script waits for the
+# 11:00 AM open and pounces. (Local time follows DST automatically, unlike the
+# UTC-based GitHub Actions schedule.)
+55 10 * * 4  cd /path/to/CLAUDE && /usr/bin/node book-swim.mjs >> book-swim.log 2>&1
 ```
 
 On macOS you can use `launchd` or `cron`; on Windows use Task Scheduler to run
