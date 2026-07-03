@@ -1,0 +1,46 @@
+name: Book Friday swim
+
+# Runs on a schedule to grab the Friday 8:00 AM drop-in swim spot as soon as
+# the booking window opens. Adjust the cron time to fire right when Markham
+# opens bookings (times are UTC — see note below).
+on:
+  workflow_dispatch: {}      # lets you run it manually from the Actions tab
+  schedule:
+    # Example: 12:01 UTC daily. Markham is UTC-4 (EDT) in summer / UTC-5 (EST)
+    # in winter, so 12:01 UTC ≈ 8:01 AM EDT / 7:01 AM EST. Change to match the
+    # exact moment your booking window opens.
+    - cron: "1 12 * * *"
+
+jobs:
+  book:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Book the swim spot
+        env:
+          PM_EMAIL: ${{ secrets.PM_EMAIL }}
+          PM_PASSWORD: ${{ secrets.PM_PASSWORD }}
+          # Uncomment / add as repository secrets or vars to override defaults:
+          # SESSION_KEYWORDS: ${{ vars.SESSION_KEYWORDS }}
+          # DAYS_AHEAD: ${{ vars.DAYS_AHEAD }}
+          HEADLESS: "1"
+        run: node book-swim.mjs
+
+      - name: Upload screenshots (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots/
+          if-no-files-found: ignore
