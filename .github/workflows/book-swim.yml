@@ -1,21 +1,28 @@
-name: Book Friday swim
+name: Book drop-in swim
 
-# Runs on a schedule to grab the Friday 8:00 AM drop-in swim spot as soon as
-# the booking window opens. Adjust the cron time to fire right when Markham
-# opens bookings (times are UTC — see note below).
+# Grabs a drop-in swim spot the moment its booking window opens. Bookings open
+# 21h before each session, so there are three windows:
+#   • Sun  7:45 AM  → opens Sat 10:45 AM Markham time
+#   • Tue  8:00 AM  → opens Mon 11:00 AM Markham time
+#   • Fri  8:00 AM  → opens Thu 11:00 AM Markham time
+# One job handles all three: the script auto-picks whichever session's window
+# is open when it runs. We fire a few minutes EARLY and let the script wait for
+# the exact open moment (up to MAX_WAIT_MINUTES) to absorb GitHub's scheduling
+# delay.
+#
+# Cron is UTC and does NOT follow DST. Active lines are for EDT (summer, UTC-4);
+# swap to the EST (winter, UTC-5) lines — one hour later in UTC — in November.
 on:
   workflow_dispatch: {}      # lets you run it manually from the Actions tab
   schedule:
-    # Booking opens Thursday 11:00 AM Markham time (21h before Fri 8:00 AM).
-    # We fire a bit EARLY and let the script wait for the exact open moment
-    # (it holds until openTime, up to MAX_WAIT_MINUTES) — this absorbs the
-    # few-minute delay GitHub often adds to scheduled runs.
-    #
-    # Cron is UTC and does NOT follow DST. 11:00 Markham =
-    #   14:45 UTC  → 10:45 EDT (summer, UTC-4)  ← active line below
-    #   15:45 UTC  → 10:45 EST (winter, UTC-5)  ← switch to this in winter
-    - cron: "45 14 * * 4"    # Thursday, EDT (summer)
-    # - cron: "45 15 * * 4"  # Thursday, EST (winter)
+    # --- Summer (EDT, UTC-4): fire ~10 min before each open --------------
+    - cron: "35 14 * * 6"    # Sat 10:35 EDT → Sunday 7:45 AM session
+    - cron: "50 14 * * 1"    # Mon 10:50 EDT → Tuesday 8:00 AM session
+    - cron: "50 14 * * 4"    # Thu 10:50 EDT → Friday 8:00 AM session
+    # --- Winter (EST, UTC-5): comment out the three above, use these -----
+    # - cron: "35 15 * * 6"  # Sat 10:35 EST → Sunday 7:45 AM session
+    # - cron: "50 15 * * 1"  # Mon 10:50 EST → Tuesday 8:00 AM session
+    # - cron: "50 15 * * 4"  # Thu 10:50 EST → Friday 8:00 AM session
 
 jobs:
   book:
@@ -38,6 +45,7 @@ jobs:
           PM_EMAIL: ${{ secrets.PM_EMAIL }}
           PM_PASSWORD: ${{ secrets.PM_PASSWORD }}
           # Uncomment / add as repository secrets or vars to override defaults:
+          # SESSIONS: ${{ vars.SESSIONS }}
           # SESSION_KEYWORDS: ${{ vars.SESSION_KEYWORDS }}
           # OPEN_HOURS_BEFORE: ${{ vars.OPEN_HOURS_BEFORE }}
           HEADLESS: "1"

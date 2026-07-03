@@ -39,6 +39,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 })();
 
 // --- configuration ----------------------------------------------------------
+const WEEKDAYS = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+
 const CONFIG = {
   email: process.env.PM_EMAIL || "",
   password: process.env.PM_PASSWORD || "",
@@ -46,13 +48,15 @@ const CONFIG = {
   calendarUrl:
     process.env.PM_CALENDAR_URL ||
     "https://cityofmarkham.perfectmind.com/Clients/BookMe4BookingPages/Classes?calendarId=39bd5c76-e07f-43f3-af24-c6969091dbb4&widgetId=6825ea71-e5b7-4c2a-948f-9195507ad90a&embed=False",
-  // Which weekday to book. 5 = Friday (0=Sun .. 6=Sat).
-  targetWeekday: Number(process.env.TARGET_WEEKDAY ?? 5),
-  // Start time of the session, as it appears on the page, e.g. "8:00 AM".
-  targetTime: process.env.TARGET_TIME || "8:00 AM",
-  // Words that must appear in the session title to disambiguate (case-insensitive).
-  // e.g. "Lane Swim", "Drop-In Swim", "Aquafit". Comma-separated = any-of match
-  // is NOT used; ALL listed words must appear. Keep it minimal.
+  // The recurring sessions to book. Each run books whichever one's booking
+  // window is open (or opening within MAX_WAIT_MINUTES). Format:
+  //   "Day H:MM AM/PM"  separated by ";"  — optional "| keywords" per entry.
+  // Override with the SESSIONS env var.
+  sessions: parseSessions(
+    process.env.SESSIONS || "Sun 7:45 AM; Tue 8:00 AM; Fri 8:00 AM"
+  ),
+  // Default words that must appear in a session title (case-insensitive, ALL
+  // must match). Used when a session entry doesn't specify its own keywords.
   titleKeywords: (process.env.SESSION_KEYWORDS || "swim")
     .split(",")
     .map((s) => s.trim().toLowerCase())
@@ -104,15 +108,39 @@ function parseTime(s) {
 }
 
 /**
- * The next occurrence of the target weekday at the target time that is still
- * in the future (local time). Returns a Date at the session start moment.
+ * Parse a sessions spec like "Sun 7:45 AM; Tue 8:00 AM | Lane Swim; Fri 8:00 AM"
+ * into [{ weekday, timeLabel, hour, minute, keywords }]. `keywords` is null
+ * when the entry doesn't override the default SESSION_KEYWORDS.
  */
-function computeTargetSession() {
-  const now = new Date();
-  const { hour, minute } = parseTime(CONFIG.targetTime);
+function parseSessions(spec) {
+  const out = spec
+    .split(";")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const [timePart, kwPart] = entry.split("|");
+      const m = /^\s*([a-z]{3,9})\.?\s+(.+?)\s*$/i.exec(timePart || "");
+      if (!m) throw new Error(`Bad session spec: "${entry}"`);
+      const weekday = WEEKDAYS[m[1].slice(0, 3).toLowerCase()];
+      if (weekday === undefined) throw new Error(`Unknown weekday in: "${entry}"`);
+      const timeLabel = m[2].trim();
+      const keywords = kwPart
+        ? kwPart.split(",").map((k) => k.trim().toLowerCase()).filter(Boolean)
+        : null;
+      return { weekday, timeLabel, ...parseTime(timeLabel), keywords };
+    });
+  if (out.length === 0) throw new Error("No sessions configured.");
+  return out;
+}
+
+/**
+ * The next occurrence of a session's weekday at its time that is still in the
+ * future (local time). Returns a Date at the session start moment.
+ */
+function nextOccurrence(session, now = new Date()) {
   const d = new Date(now);
-  d.setHours(hour, minute, 0, 0);
-  while (d.getDay() !== CONFIG.targetWeekday || d <= now) {
+  d.setHours(session.hour, session.minute, 0, 0);
+  while (d.getDay() !== session.weekday || d <= now) {
     d.setDate(d.getDate() + 1);
   }
   return d;
@@ -256,8 +284,9 @@ async function navigateToDate(page, targetDate) {
  * Locate the session card for the target day + time + keywords and open it.
  * Returns the clickable "book" affordance found within, or null.
  */
-async function findAndOpenSession(page, targetDate) {
-  const timeRe = new RegExp(CONFIG.targetTime.replace(/\s+/g, "\\s*"), "i");
+async function findAndOpenSession(page, targetDate, session) {
+  const timeRe = new RegExp(session.timeLabel.replace(/\s+/g, "\\s*"), "i");
+  const keywords = session.keywords || CONFIG.titleKeywords;
   const dayNameRe = new RegExp(
     targetDate.toLocaleDateString("en-CA", { weekday: "long" }),
     "i"
@@ -266,7 +295,7 @@ async function findAndOpenSession(page, targetDate) {
   // Candidate rows: anything that mentions the target time.
   const timeMatches = page.getByText(timeRe);
   const count = await timeMatches.count();
-  log(`Found ${count} element(s) mentioning "${CONFIG.targetTime}".`);
+  log(`Found ${count} element(s) mentioning "${session.timeLabel}".`);
 
   for (let i = 0; i < count; i++) {
     const node = timeMatches.nth(i);
@@ -279,7 +308,7 @@ async function findAndOpenSession(page, targetDate) {
     const container = (await card.count()) > 0 ? card : node;
     const text = ((await container.innerText().catch(() => "")) || "").toLowerCase();
 
-    const keywordsOk = CONFIG.titleKeywords.every((k) => text.includes(k));
+    const keywordsOk = keywords.every((k) => text.includes(k));
     // Day check is best-effort: the card may not repeat the weekday, so we
     // only reject if it clearly names a DIFFERENT weekday.
     const namesAWeekday = /\b(sun|mon|tue|wed|thu|fri|sat)\w*day\b/i.test(text);
@@ -369,6 +398,77 @@ async function completeBooking(page) {
   return "submitted";
 }
 
+/** Short filename-safe tag for a session, e.g. "fri-8-00-am". */
+function slug(session) {
+  return `${["sun", "mon", "tue", "wed", "thu", "fri", "sat"][session.weekday]}-${session.timeLabel
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")}`;
+}
+
+/**
+ * Wait for one session's window to open (if needed), then find + book it,
+ * retrying through the opening rush. Returns { ok, note }.
+ */
+async function bookOne(page, cand) {
+  const { session, start, open } = cand;
+  const label = `${fmtLong(start)} @ ${session.timeLabel}`;
+  const tag = slug(session);
+
+  if (open.getTime() > Date.now() && !CONFIG.dryRun) {
+    await waitUntil(open, `booking window opens for ${label}`);
+    log("🟢 Window open — going for it.");
+  }
+
+  for (let attempt = 1; attempt <= CONFIG.bookRetries; attempt++) {
+    log(`[${tag}] Attempt ${attempt}/${CONFIG.bookRetries}…`);
+    // Fresh load each attempt for up-to-date availability.
+    await page.goto(CONFIG.calendarUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(2500);
+    await navigateToDate(page, start);
+    if (attempt === 1) await shot(page, `${tag}-calendar`);
+
+    const opened = await findAndOpenSession(page, start, session);
+    if (!opened) {
+      log(`[${tag}] Session not found/openable on this attempt.`);
+      if (attempt < CONFIG.bookRetries) {
+        await page.waitForTimeout(CONFIG.bookRetryDelayMs);
+        continue;
+      }
+      await shot(page, `${tag}-not-found`);
+      return {
+        ok: false,
+        note:
+          `Could not find "${(session.keywords || CONFIG.titleKeywords).join(" ")}" at ` +
+          `${session.timeLabel} on ${fmtLong(start)} after ${CONFIG.bookRetries} attempts ` +
+          `(full, not open yet, or keywords/time need adjusting).`,
+      };
+    }
+
+    const status = await completeBooking(page);
+    await shot(page, `${tag}-result-${attempt}`);
+
+    const body = (await page.locator("body").innerText().catch(() => "")) || "";
+    const looksConfirmed = /confirmed|booked|success|thank you|reservation/i.test(body);
+
+    if (CONFIG.dryRun) {
+      log(`🧪 [${tag}] Dry run reached checkout — review screenshots.`);
+      return { ok: true, note: `dry run for ${label}` };
+    }
+    if (status === "submitted" && looksConfirmed) {
+      log(`✅ [${tag}] Booking confirmed for ${label}`);
+      return { ok: true, note: `confirmed ${label}` };
+    }
+    if (status === "submitted") {
+      log(`[${tag}] Submitted, but couldn't positively confirm — check the screenshot.`);
+      return { ok: true, note: `submitted (unconfirmed) ${label}` };
+    }
+    log(`[${tag}] Booking didn't complete on this attempt.`);
+    if (attempt < CONFIG.bookRetries) await page.waitForTimeout(CONFIG.bookRetryDelayMs);
+  }
+  return { ok: false, note: `exhausted ${CONFIG.bookRetries} attempts for ${label}` };
+}
+
 async function main() {
   if (!CONFIG.email || !CONFIG.password) {
     return fail(
@@ -376,29 +476,52 @@ async function main() {
     );
   }
 
-  const targetDate = computeTargetSession();
-  const openTime = computeOpenTime(targetDate);
-  log("Target session:", fmtLong(targetDate), "@", CONFIG.targetTime);
-  log(
-    `Booking opens ${CONFIG.openHoursBefore}h before →`,
-    openTime.toLocaleString("en-CA")
-  );
-  log("Keywords:", CONFIG.titleKeywords.join(" + ") || "(none)");
+  const now = new Date();
+  const maxWaitMs = CONFIG.maxWaitMinutes * 60000;
+
+  // For each configured session, find the next occurrence + its open moment.
+  const candidates = CONFIG.sessions
+    .map((session) => {
+      const start = nextOccurrence(session, now);
+      const open = computeOpenTime(start);
+      return { session, start, open, msUntilOpen: open.getTime() - now.getTime() };
+    })
+    .sort((a, b) => a.open - b.open);
+
+  log("Configured sessions & next booking windows:");
+  for (const c of candidates) {
+    log(
+      `  • ${fmtLong(c.start)} @ ${c.session.timeLabel} — opens ` +
+        `${c.open.toLocaleString("en-CA")} (${Math.round(c.msUntilOpen / 60000)} min)`
+    );
+  }
   log("Mode:", CONFIG.dryRun ? "DRY RUN" : "LIVE", "| headless:", CONFIG.headless);
 
-  // Decide whether to wait for the window, book now, or bail out.
-  const msUntilOpen = openTime.getTime() - Date.now();
-  if (msUntilOpen > 0 && !CONFIG.dryRun) {
-    const maxWaitMs = CONFIG.maxWaitMinutes * 60000;
-    if (msUntilOpen > maxWaitMs && !CONFIG.force) {
-      return fail(
-        `Booking doesn't open until ${openTime.toLocaleString("en-CA")} ` +
-          `(${Math.round(msUntilOpen / 60000)} min from now), which is beyond ` +
-          `MAX_WAIT_MINUTES=${CONFIG.maxWaitMinutes}. Schedule this run closer to ` +
-          `the open time, raise MAX_WAIT_MINUTES, or set FORCE=1 to wait anyway.`
-      );
+  // Which sessions should we act on now? Any whose window is open, or opening
+  // within MAX_WAIT_MINUTES. In dry-run we just exercise the soonest one.
+  let targets;
+  if (CONFIG.dryRun) {
+    targets = [candidates[0]];
+  } else {
+    targets = candidates.filter((c) => c.msUntilOpen <= maxWaitMs);
+    if (targets.length === 0) {
+      if (!CONFIG.force) {
+        const soonest = candidates[0];
+        return fail(
+          `No booking window is open or within MAX_WAIT_MINUTES=${CONFIG.maxWaitMinutes}. ` +
+            `Soonest is ${fmtLong(soonest.start)} @ ${soonest.session.timeLabel}, opening ` +
+            `${soonest.open.toLocaleString("en-CA")} ` +
+            `(${Math.round(soonest.msUntilOpen / 60000)} min from now). Schedule closer to ` +
+            `an open time, raise MAX_WAIT_MINUTES, or set FORCE=1.`
+        );
+      }
+      targets = [candidates[0]];
     }
   }
+  log(
+    "Acting on:",
+    targets.map((c) => `${fmtLong(c.start)} @ ${c.session.timeLabel}`).join("; ")
+  );
 
   const launchOpts = { headless: CONFIG.headless };
   if (CONFIG.executablePath) launchOpts.executablePath = CONFIG.executablePath;
@@ -413,74 +536,18 @@ async function main() {
   const page = await context.newPage();
   page.setDefaultTimeout(CONFIG.timeoutMs);
 
+  const results = [];
   try {
     log("Opening calendar…");
     await page.goto(CONFIG.calendarUrl, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(2500);
 
     await ensureLoggedIn(page);
-    // Persist the session for next time.
     await context.storageState({ path: CONFIG.storageStatePath }).catch(() => {});
 
-    // We're logged in and ready. Now hold until the booking window opens
-    // (spots for this session go live exactly at `openTime`).
-    if (openTime.getTime() > Date.now() && !CONFIG.dryRun) {
-      await waitUntil(openTime, "booking window opens");
-      log("🟢 Window open — going for it.");
-    }
-
-    // Try repeatedly: right at open, the session may take a beat to appear or
-    // may briefly show as full during the rush.
-    let booked = false;
-    for (let attempt = 1; attempt <= CONFIG.bookRetries && !booked; attempt++) {
-      log(`Attempt ${attempt}/${CONFIG.bookRetries}…`);
-      // Fresh load each attempt for up-to-date availability.
-      await page.goto(CONFIG.calendarUrl, { waitUntil: "domcontentloaded" });
-      await page.waitForTimeout(2500);
-      await navigateToDate(page, targetDate);
-      if (attempt === 1) await shot(page, "calendar");
-
-      const opened = await findAndOpenSession(page, targetDate);
-      if (!opened) {
-        log("Session not found/openable on this attempt.");
-        if (attempt < CONFIG.bookRetries) {
-          await page.waitForTimeout(CONFIG.bookRetryDelayMs);
-          continue;
-        }
-        await shot(page, "session-not-found");
-        return fail(
-          `Could not find a "${CONFIG.titleKeywords.join(" ")}" session at ${CONFIG.targetTime} ` +
-            `on ${fmtLong(targetDate)} after ${CONFIG.bookRetries} attempts. It may be full, ` +
-            `not open yet, or the keywords/time need adjusting. See ${CONFIG.screenshotDir}.`
-        );
-      }
-
-      const status = await completeBooking(page);
-      await shot(page, `result-attempt-${attempt}`);
-
-      const body = (await page.locator("body").innerText().catch(() => "")) || "";
-      const looksConfirmed = /confirmed|booked|success|thank you|reservation/i.test(body);
-
-      if (CONFIG.dryRun) {
-        log("🧪 Dry run finished. Review screenshots to confirm the flow reached checkout.");
-        booked = true;
-      } else if (status === "submitted" && looksConfirmed) {
-        log("✅ Booking confirmed for", fmtLong(targetDate));
-        booked = true;
-      } else if (status === "submitted") {
-        log("Submitted, but couldn't positively confirm from page text — check the screenshot.");
-        booked = true;
-      } else {
-        log("Booking didn't complete on this attempt.");
-        if (attempt < CONFIG.bookRetries) await page.waitForTimeout(CONFIG.bookRetryDelayMs);
-      }
-    }
-
-    if (!booked && !CONFIG.dryRun) {
-      return fail(
-        `Exhausted ${CONFIG.bookRetries} attempts without a confirmed booking. ` +
-          `The spot may have filled, or a selector needs adjusting. See ${CONFIG.screenshotDir}.`
-      );
+    for (const cand of targets) {
+      const r = await bookOne(page, cand);
+      results.push(r);
     }
   } catch (err) {
     await shot(page, "error");
@@ -488,6 +555,12 @@ async function main() {
   } finally {
     await context.storageState({ path: CONFIG.storageStatePath }).catch(() => {});
     await browser.close();
+  }
+
+  const failed = results.filter((r) => !r.ok);
+  log("Summary:", results.map((r) => (r.ok ? "✅ " : "❌ ") + r.note).join(" | ") || "(nothing attempted)");
+  if (failed.length > 0) {
+    fail(`${failed.length} of ${results.length} booking(s) did not complete. See ${CONFIG.screenshotDir}.`);
   }
 }
 
