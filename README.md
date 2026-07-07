@@ -131,6 +131,29 @@ A workflow is included at `.github/workflows/book-swim.yml`.
 On macOS you can use `launchd` or `cron`; on Windows use Task Scheduler to run
 `node book-swim.mjs`.
 
+## Notifications
+
+By default the result only appears in the run output:
+
+- **Locally:** the terminal, ending with a `Summary: ✅ … / ❌ …` line (and in
+  `book-swim.log` if you use the cron redirect above).
+- **GitHub Actions:** the run's logs + the uploaded `screenshots` artifact.
+  GitHub emails you automatically when a scheduled run **fails**, but not on
+  success.
+
+To get a **phone notification on every run** (success or failure), set
+`NOTIFY_WEBHOOK_URL` to a Slack or Discord *Incoming Webhook* URL — the script
+POSTs a one-line ✅/❌ summary to it:
+
+- **Slack:** create an Incoming Webhook (https://api.slack.com/messaging/webhooks),
+  then add it as `NOTIFY_WEBHOOK_URL` in `.env` (local) or as a repository
+  secret (GitHub Actions — the workflow already passes it through).
+- **Discord:** Server Settings → Integrations → Webhooks → New Webhook, copy
+  the URL, use it the same way.
+
+If you'd prefer email or a Google Calendar event instead of a webhook, that can
+be added — the hook point is the `notify()` function in `book-swim.mjs`.
+
 ## Notes & limitations
 
 - **This is not tested against the live authenticated site** (bookings require

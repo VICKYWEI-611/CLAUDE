@@ -48,6 +48,8 @@ jobs:
           # SESSIONS: ${{ vars.SESSIONS }}
           # SESSION_KEYWORDS: ${{ vars.SESSION_KEYWORDS }}
           # OPEN_HOURS_BEFORE: ${{ vars.OPEN_HOURS_BEFORE }}
+          # Add a Slack/Discord Incoming Webhook secret to get a phone alert:
+          NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
           HEADLESS: "1"
           MAX_WAIT_MINUTES: "45"   # cover early fire + GitHub's scheduling delay
         run: node book-swim.mjs

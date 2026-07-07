@@ -89,9 +89,34 @@ const CONFIG = {
   // Optional: route the browser through an HTTPS proxy (needed in some CI /
   // sandbox environments; not needed on a normal home machine).
   proxyServer: process.env.PW_PROXY || process.env.HTTPS_PROXY || undefined,
+  // Optional: a Slack/Discord "Incoming Webhook" URL. When set, each run posts
+  // its result here so you get a phone notification instead of reading logs.
+  notifyWebhook: process.env.NOTIFY_WEBHOOK_URL || "",
 };
 
 const log = (...a) => console.log(new Date().toISOString(), "-", ...a);
+
+/**
+ * Post a result summary to the configured webhook (Slack- and Discord-style
+ * both accept a JSON body with a "text"/"content" field). Best-effort: a
+ * notification failure never fails the booking.
+ */
+async function notify(text) {
+  if (!CONFIG.notifyWebhook) return;
+  try {
+    const res = await fetch(CONFIG.notifyWebhook, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      // "text" is Slack's field; "content" is Discord's. Sending both is
+      // harmless — each service reads the one it recognises.
+      body: JSON.stringify({ text, content: text }),
+    });
+    if (!res.ok) log(`(notification webhook returned HTTP ${res.status})`);
+    else log("🔔 Notification sent.");
+  } catch (e) {
+    log("(could not send notification)", e.message);
+  }
+}
 
 function fail(msg) {
   console.error("\n❌ " + msg);
@@ -577,6 +602,7 @@ async function main() {
   page.setDefaultTimeout(CONFIG.timeoutMs);
 
   const results = [];
+  let crashed = null;
   try {
     log("Opening calendar…");
     await page.goto(CONFIG.calendarUrl, { waitUntil: "domcontentloaded" });
@@ -591,14 +617,25 @@ async function main() {
     }
   } catch (err) {
     await shot(page, "error");
-    fail(err.stack || String(err));
+    crashed = err.stack || String(err);
+    fail(crashed);
   } finally {
     await context.storageState({ path: CONFIG.storageStatePath }).catch(() => {});
     await browser.close();
   }
 
   const failed = results.filter((r) => !r.ok);
-  log("Summary:", results.map((r) => (r.ok ? "✅ " : "❌ ") + r.note).join(" | ") || "(nothing attempted)");
+  const detail = results.map((r) => (r.ok ? "✅ " : "❌ ") + r.note).join(" | ") || "(nothing attempted)";
+  log("Summary:", detail);
+
+  // Build a one-line headline for the notification.
+  let headline;
+  if (crashed) headline = "❌ Swim booker errored";
+  else if (results.length === 0) headline = "⚠️ Swim booker: nothing attempted";
+  else if (failed.length === 0) headline = `✅ Swim booked: ${results.map((r) => r.note).join("; ")}`;
+  else headline = `❌ Swim booking failed (${failed.length}/${results.length})`;
+  await notify(`${headline}\n${detail}`);
+
   if (failed.length > 0) {
     fail(`${failed.length} of ${results.length} booking(s) did not complete. See ${CONFIG.screenshotDir}.`);
   }
