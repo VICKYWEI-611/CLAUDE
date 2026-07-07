@@ -61,6 +61,9 @@ const CONFIG = {
     .split(",")
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean),
+  // Attendee name to tick on the booking form, if a name checklist appears.
+  // Defaults to the email's local part; set PM_ATTENDEE_NAME for a real name.
+  attendeeName: process.env.PM_ATTENDEE_NAME || "",
   // Booking opens this many hours before the session start time.
   // Friday 8:00 AM session => opens Thursday 11:00 AM (8:00 - 21h).
   openHoursBefore: Number(process.env.OPEN_HOURS_BEFORE ?? 21),
@@ -199,7 +202,7 @@ async function ensureLoggedIn(page) {
 
   if ((await loginTrigger.count()) === 0) {
     log("Already appears logged in (no login control found).");
-    return;
+    return false;
   }
 
   log("Logging in as", CONFIG.email);
@@ -236,6 +239,7 @@ async function ensureLoggedIn(page) {
     );
   }
   log("✅ Logged in.");
+  return true;
 }
 
 /**
@@ -285,7 +289,12 @@ async function navigateToDate(page, targetDate) {
  * Returns the clickable "book" affordance found within, or null.
  */
 async function findAndOpenSession(page, targetDate, session) {
-  const timeRe = new RegExp(session.timeLabel.replace(/\s+/g, "\\s*"), "i");
+  const timePat = session.timeLabel.replace(/\s+/g, "\\s*");
+  const timeRe = new RegExp(timePat, "i");
+  // Same time, but only when it's a START time — i.e. NOT immediately preceded
+  // by a range separator ("-", "–", "—", or "to"). This stops us matching the
+  // END time of an adjacent session (e.g. "7:00 AM - 8:00 AM" vs "8:00 AM …").
+  const startTimeRe = new RegExp(`(?<![-–—]\\s*)(?<!to\\s*)${timePat}`, "i");
   const keywords = session.keywords || CONFIG.titleKeywords;
   const dayNameRe = new RegExp(
     targetDate.toLocaleDateString("en-CA", { weekday: "long" }),
@@ -309,12 +318,15 @@ async function findAndOpenSession(page, targetDate, session) {
     const text = ((await container.innerText().catch(() => "")) || "").toLowerCase();
 
     const keywordsOk = keywords.every((k) => text.includes(k));
+    // Reject when the time only appears as an END time (e.g. this is the
+    // 7:00–8:00 card, not the 8:00–9:00 one we want).
+    const startOk = startTimeRe.test(text);
     // Day check is best-effort: the card may not repeat the weekday, so we
     // only reject if it clearly names a DIFFERENT weekday.
     const namesAWeekday = /\b(sun|mon|tue|wed|thu|fri|sat)\w*day\b/i.test(text);
     const dayOk = !namesAWeekday || dayNameRe.test(text);
 
-    if (!keywordsOk || !dayOk) continue;
+    if (!keywordsOk || !dayOk || !startOk) continue;
 
     log("Matched session card:", text.replace(/\s+/g, " ").slice(0, 120));
 
@@ -361,10 +373,16 @@ async function completeBooking(page) {
   }
 
   // Make sure the account holder is selected as the attendee, if a checklist
-  // of names is shown.
-  const attendeeCheckbox = page
-    .getByRole("checkbox", { name: new RegExp(CONFIG.email.split("@")[0], "i") })
-    .first();
+  // of names is shown. Match by name (PM_ATTENDEE_NAME, else the email's local
+  // part) as a plain case-insensitive substring — passing a string to `name`
+  // avoids treating user input as a regex.
+  const attendeeName = CONFIG.attendeeName || CONFIG.email.split("@")[0];
+  let attendeeCheckbox = page.getByRole("checkbox", { name: attendeeName }).first();
+  if ((await attendeeCheckbox.count()) === 0) {
+    // Fallback: if there's exactly one attendee checkbox, it's us.
+    const allBoxes = page.getByRole("checkbox");
+    if ((await allBoxes.count()) === 1) attendeeCheckbox = allBoxes.first();
+  }
   if ((await attendeeCheckbox.count()) > 0 && !(await attendeeCheckbox.isChecked().catch(() => false))) {
     await attendeeCheckbox.check().catch(() => {});
   }
@@ -425,6 +443,13 @@ async function bookOne(page, cand) {
     // Fresh load each attempt for up-to-date availability.
     await page.goto(CONFIG.calendarUrl, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(2500);
+    // Re-establish login if the session expired during a long wait — a stale
+    // cookie can otherwise make us silently operate logged-out. A fresh login
+    // may redirect off the calendar, so reload it before continuing.
+    if (await ensureLoggedIn(page)) {
+      await page.goto(CONFIG.calendarUrl, { waitUntil: "domcontentloaded" });
+      await page.waitForTimeout(2500);
+    }
     await navigateToDate(page, start);
     if (attempt === 1) await shot(page, `${tag}-calendar`);
 
@@ -455,7 +480,10 @@ async function bookOne(page, cand) {
       log(`🧪 [${tag}] Dry run reached checkout — review screenshots.`);
       return { ok: true, note: `dry run for ${label}` };
     }
-    if (status === "submitted" && looksConfirmed) {
+    // Success if we submitted, OR if the page shows confirmation text — some
+    // drop-ins book in a single "Book Now" with no separate confirm button
+    // (completeBooking returns "no-confirm" but the booking still went through).
+    if (looksConfirmed) {
       log(`✅ [${tag}] Booking confirmed for ${label}`);
       return { ok: true, note: `confirmed ${label}` };
     }
@@ -498,10 +526,22 @@ async function main() {
   log("Mode:", CONFIG.dryRun ? "DRY RUN" : "LIVE", "| headless:", CONFIG.headless);
 
   // Which sessions should we act on now? Any whose window is open, or opening
-  // within MAX_WAIT_MINUTES. In dry-run we just exercise the soonest one.
+  // within MAX_WAIT_MINUTES. In dry-run we exercise a session whose window is
+  // ALREADY open (so the flow can reach checkout); if none is open we fall back
+  // to the soonest and warn, since it won't be bookable yet.
   let targets;
   if (CONFIG.dryRun) {
-    targets = [candidates[0]];
+    const openNow = candidates.filter((c) => c.msUntilOpen <= 0);
+    if (openNow.length > 0) {
+      targets = [openNow[openNow.length - 1]]; // most recently opened → most likely still listed
+    } else {
+      targets = [candidates[0]];
+      log(
+        "⚠️  DRY RUN: no session's booking window is open right now, so this " +
+          "session won't be bookable yet — the flow may not reach checkout. Run " +
+          "a dry run during an open window to fully exercise it."
+      );
+    }
   } else {
     targets = candidates.filter((c) => c.msUntilOpen <= maxWaitMs);
     if (targets.length === 0) {
