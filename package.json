@@ -1,0 +1,22 @@
+{
+  "name": "markham-swim-booker",
+  "version": "1.0.0",
+  "description": "Auto-book a Friday drop-in swim spot at Aaniin Community Centre (PerfectMind)",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "book": "node book-swim.mjs",
+    "dry": "DRY_RUN=1 HEADLESS=0 node book-swim.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://local_proxy@127.0.0.1:41729/git/VICKYWEI-611/CLAUDE"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "playwright": "^1.61.1"
+  }
+}

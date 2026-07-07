@@ -1,0 +1,63 @@
+name: Book drop-in swim
+
+# Grabs a drop-in swim spot the moment its booking window opens. Bookings open
+# 21h before each session, so there are three windows:
+#   • Sun  7:45 AM  → opens Sat 10:45 AM Markham time
+#   • Tue  8:00 AM  → opens Mon 11:00 AM Markham time
+#   • Fri  8:00 AM  → opens Thu 11:00 AM Markham time
+# One job handles all three: the script auto-picks whichever session's window
+# is open when it runs. We fire a few minutes EARLY and let the script wait for
+# the exact open moment (up to MAX_WAIT_MINUTES) to absorb GitHub's scheduling
+# delay.
+#
+# Cron is UTC and does NOT follow DST. Active lines are for EDT (summer, UTC-4);
+# swap to the EST (winter, UTC-5) lines — one hour later in UTC — in November.
+on:
+  workflow_dispatch: {}      # lets you run it manually from the Actions tab
+  schedule:
+    # --- Summer (EDT, UTC-4): fire ~10 min before each open --------------
+    - cron: "35 14 * * 6"    # Sat 10:35 EDT → Sunday 7:45 AM session
+    - cron: "50 14 * * 1"    # Mon 10:50 EDT → Tuesday 8:00 AM session
+    - cron: "50 14 * * 4"    # Thu 10:50 EDT → Friday 8:00 AM session
+    # --- Winter (EST, UTC-5): comment out the three above, use these -----
+    # - cron: "35 15 * * 6"  # Sat 10:35 EST → Sunday 7:45 AM session
+    # - cron: "50 15 * * 1"  # Mon 10:50 EST → Tuesday 8:00 AM session
+    # - cron: "50 15 * * 4"  # Thu 10:50 EST → Friday 8:00 AM session
+
+jobs:
+  book:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Book the swim spot
+        env:
+          PM_EMAIL: ${{ secrets.PM_EMAIL }}
+          PM_PASSWORD: ${{ secrets.PM_PASSWORD }}
+          # Uncomment / add as repository secrets or vars to override defaults:
+          # SESSIONS: ${{ vars.SESSIONS }}
+          # SESSION_KEYWORDS: ${{ vars.SESSION_KEYWORDS }}
+          # OPEN_HOURS_BEFORE: ${{ vars.OPEN_HOURS_BEFORE }}
+          # Add a Slack/Discord Incoming Webhook secret to get a phone alert:
+          NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+          HEADLESS: "1"
+          MAX_WAIT_MINUTES: "45"   # cover early fire + GitHub's scheduling delay
+        run: node book-swim.mjs
+
+      - name: Upload screenshots (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots/
+          if-no-files-found: ignore
